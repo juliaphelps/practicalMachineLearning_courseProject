@@ -1,0 +1,359 @@
+---
+title: "Random Forest Modeling for Predicting Outcome Class of Human Activity Recognition Data"
+author: "Author: Julia Phelps"
+date: "June 2nd, 2016"
+output: html_document
+---
+
+--------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## <b>Overview</b>
+
+This analysis attempts to use Human Activity Recognition data from 
+[http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har)
+to maximize the accuracy of outcome class prediction on a large scale.  Through 
+utilization of Random Forest techniques, combined with structured feature 
+selection and K-fold Cross-Validation, the analysis is able to predict outcomes 
+with an accuracy of ~99% or greater. This analysis was produced to satisfy 
+Course Project requirements for the class *Practical Machine Learning*, offered 
+through [Coursera.org](http://www.coursera.org).
+
+<br>
+
+## <b>Load Required Packages and Data Sets</b>
+
+There are several packages necessary for this analysis, which include `caret`, 
+`randomForest`, `parallel`, `doParallel`,`pander`, `ggplot2`, and `Cairo`. The 
+original `index.Rmd` file will attempt to load these packages in the 
+background. If you do not already have them installed on your machine, please 
+see *Appendix: ii.* for the installation code.
+
+```{r loadData01, eval=TRUE, echo=FALSE}
+## attempt to load or install/load required packages
+suppressMessages(require(pander))
+suppressMessages(require(ggplot2))
+suppressMessages(require(Cairo))
+suppressMessages(require(caret))
+suppressMessages(require(parallel))
+suppressMessages(require(doParallel))
+suppressMessages(require(randomForest))
+```
+
+```{r loadData2, echo=TRUE, eval=TRUE}
+## if necessary, download data into working directory
+if(!file.exists("pml-training.csv")){
+    download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                  destfile="pml-training.csv", mode="wb")
+}
+if(!file.exists("pml-testing.csv")){
+    download.file(url="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+                  destfile="pml-testing.csv", mode="wb")
+}
+
+## import data into R
+trainRaw <- read.csv(file="pml-training.csv")
+testRaw <- read.csv(file="pml-testing.csv")
+```
+
+<br>
+
+## <b>Description of Data and Goal of Prediction Analysis</b>
+
+```{r explore01, eval=TRUE, echo=FALSE}
+trainRaw_dim <- dim(trainRaw)
+testRaw_dim <- dim(testRaw)
+```
+
+The data provided by Coursera.org for this analysis originally comes from 
+[http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har), 
+as described in the paper **Qualitative Activity Recognition of Weight Lifting 
+Exercises** (*see Appendix: i.*). The original goal of the study was to define, 
+via qualitative measurements from sensors placed on the body, how "well" (in 
+other words, accurately) a subject performed a given exercise. In the study, 
+the researchers gathered measurements from four key areas of the body while the 
+subjects performed repetitions of the Unilateral Dumbbell Biceps Curl exercise, 
+and then attempted to classify them into one of five categories.
+
+The subset of this data that is provided to us is composed of a training set with 
+`r trainRaw_dim[1]` observations of `r trainRaw_dim[2]` variables, and a testing 
+set with `r testRaw_dim[1]` observations and `r testRaw_dim[2]` variables. The 
+data in each is a mix of numeric, integer, and factor variables. In the training 
+set, the outcome `'classe'` is as follows:
+
+```{r explore02, eval=TRUE, echo=FALSE, results="asis"}
+description <- c("exactly according to description", 
+                 "throwing the elbows to the front", 
+                 "lifting the dumbbell only halfway", 
+                 "lowering the dumbbell only halfway", 
+                 "throwing the hips to the front")
+classTable <- data.frame(table(trainRaw$classe), description)
+colnames(classTable) <- c("Class", "Frequency", "Description")
+pandoc.table(classTable, justify="left")
+```
+
+The goal of this analysis is to use Machine Learning techniques to accurately 
+predict the class of each activity, using any or all of the variables provided 
+and a method of our choosing.
+
+<br>
+
+## <b>Exploration and Selection of Features</b>
+
+Since the data has numerous variables, our first task is to explore the data and 
+determine what features will be most useful for prediction. A simple comparison 
+of variable names between the `trainRaw` and `testRaw` data sets reveals that 
+the first 159 variables in each set are the same. However, the 160th variable in 
+the `trainRaw` set is `'classe'`, which has the Class outcomes for its 
+observations, while the 160th variable in the `testRaw` set is `'problem_id'`, 
+which will be used to grade final prediction results. To make our feature 
+selection process easier, let's split out the two different variables from their 
+respective sets.
+
+```{r explore03, eval=TRUE, echo=TRUE}
+train_classe <- trainRaw$classe
+trainRaw <- trainRaw[,-160]
+test_problem_id <- testRaw$problem_id
+testRaw <- testRaw[,-160]
+```
+
+<br>
+
+#### <b>1. NA values</b>
+
+Next, let's look at how much of the data in our `trainRaw` set is complete.
+
+```{r explore04, eval=TRUE, echo=TRUE, results="asis"}
+pandoc.table(table(is.na(trainRaw)))
+```
+
+In `trainRaw`, ~41% of the values are NA. Let's take a look at how many 
+variables contain these NA values.
+
+```{r explore05, eval=TRUE, echo=TRUE, results="asis"}
+train_isNA <- sapply(trainRaw, function(x) sum(is.na(x)))
+pandoc.table(table(train_isNA))
+```
+
+There are 67 variables within the data set where 19216 out of 19622 observations 
+are missing. Given the large proportion (~98%) of NA values in these variables, 
+it does not make sense to try to include them as features when we build our 
+prediction algorithm. However, since we will eventually want to apply this 
+model to the values in our test set, we should also check to see how many of its 
+variables contain NA values.
+
+```{r explore06, eval=TRUE, echo=TRUE, results="asis"}
+test_isNA <- sapply(testRaw, function(x) sum(is.na(x)))
+pandoc.table(table(test_isNA))
+```
+
+Only 59 of the variables in the `testRaw` data set contain values; the rest are 
+entirely NA. Let's check and see which variables in `test_isNA` are also 
+contained in `train_isNA`.
+
+```{r explore07, eval=TRUE, echo=TRUE}
+train_nonNA <- names(train_isNA[train_isNA==0])
+test_nonNA <- names(test_isNA[test_isNA==0])
+sum(test_nonNA %in% train_nonNA)
+```
+
+Since all 59 of the non-NA variables in `test_isNA` are also in the non-NA 
+variables of `train_isNA`, we will only keep the 59 variables in `test_isNA`.
+
+
+```{r explore08, eval=TRUE, echo=TRUE}
+train <- trainRaw[,test_nonNA]
+test <- testRaw[,test_nonNA]
+```
+
+<br>
+
+#### <b>2. Selecting features</b>
+
+Description of the various measurements made in this dataset can be found in the 
+paper **Qualitative Activity Recognition of Weight Lifting Exercises** (*see 
+Appendix: i.*). The data set is comprised of various quantitative measurements 
+taken while performing a Unilateral Dumbbell Biceps Curl from four key areas of 
+the body: Armband (indicated as 'arm'), Glove (indicated as 'forearm'), Lumbar 
+Belt (indicated as 'belt'), and Dumbbell. For the purposes of our prediction 
+algorithm, we will focus on measurements from these four areas.
+
+```{r explore09a, eval=FALSE, echo=FALSE}
+str(train, vec.len=2, list.len=10)
+```
+
+```{r explore09b, eval=TRUE, echo=TRUE}
+head(names(train), 10)
+```
+
+Given that the variable that we are trying to predict, `'classe'`, does not 
+necessarily depend on a time series, we will subset out the 3 'timestamp' 
+variables and the 'window' variables, as well as the `'X'` (row number) and 
+`'user_name'` (subject name) variables in both of our data sets.
+
+```{r explore10, eval=TRUE, echo=TRUE}
+train <- train[,8:59]
+test <- test[,8:59]
+```
+```{r explore11, eval=TRUE, echo=FALSE}
+train_dim <- dim(train)
+```
+
+We are left with a total of `r train_dim[2]` features in our training set, which 
+we will use to build our prediction algorithm.
+
+<br>
+
+#### <b>3. Splitting into 'training' and 'validation' sets</b>
+
+In order to get a better estimate of accuracy of our prediction algorithm before 
+we apply it to the final `'test'` set, it will be helpful to subset our `'train'` 
+data set into `'training'` and `'validation'` sets. Before we subset the 
+`'train'` data, we can add our outcome variable `'classe'` back into the set:
+
+```{r subsets01, eval=TRUE, echo=TRUE}
+train$classe <- train_classe
+set.seed(53535)
+inTraining <- createDataPartition(y=train$classe, p=0.8, list=FALSE)
+training <- train[inTraining,]
+validation <- train[-inTraining,]
+```
+
+```{r subsets02, eval=TRUE, echo=FALSE}
+training_dim <- dim(training)
+validation_dim <- dim(validation)
+```
+
+Our `training` set, which we will use to build our model, includes of 
+`r training_dim[1]` observations. We will use the smaller `validation` set, 
+consisting of `r validation_dim[1]` observations, to get a more accurate measure 
+of Out-of-Sample prediction accuracy.
+
+<br>
+
+## <b>Training the Model</b>
+
+We have a considerable number of features to predict on, even after subsetting. 
+With this in mind, the Random Forest method is a good choice for training our 
+model because it can accurately handle a large number of predictors.  
+
+However, Random Forest algorithms can be very computationally-intensive. To 
+help alleviate this problem, we will employ parallel implementation of our model 
+across multiple cores. Likewise, we will use K-Fold Cross Validation (rather 
+than the default bootstrap method) in order to improve computation efficiency. 
+Although K-Fold Cross-Validation can be less accurate, it does not appear to 
+significantly detract from our prediction accuracy in this case. Lastly, we will 
+split our data into predictors and outcomes, which has been shown to have a 
+positive effect on computational time (as opposed to using a single data.frame).
+
+```{r training01, eval=TRUE, echo=TRUE, cache=FALSE}
+training_x <- training[,-53]
+training_y <- training[,53]
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+trainingControl <- trainControl(method="cv", number=5, allowParallel=TRUE)
+trainingFit <- train(training_x, training_y, method="rf", data=training, 
+                     trControl=trainingControl)
+stopCluster(cluster)
+
+```
+
+Let's take a look at our model fit:
+
+```{r training02, eval=TRUE, echo=FALSE}
+trainingFit
+```
+
+The In-Sample Accuracy for the final model, `mtry=2`, is ~99.2%.  We can also 
+look at Variable Importance to see which of our features were the most important 
+to classifying our predictions.
+
+```{r training03, eval=TRUE, echo=FALSE, dev="CairoPNG", fig.width=8, fig.height=4}
+train_varImp <- varImp(trainingFit)
+train_varImp_hist <- ggplot(train_varImp, top=15) + theme_bw() + 
+    theme(axis.text=element_text(size=8), 
+          plot.margin=unit(c(0.5, 1, 0.5, 1), "cm"), 
+          axis.title.x=element_text(margin=unit(c(0.35, 0, 0, 0), "cm")),
+          axis.title.y=element_text(margin=unit(c(0, 0.35, 0, 0), "cm")))
+train_varImp_hist
+```
+
+## <b>Out-of-Sample Error</b>
+
+To get a better idea of the Out-of-Sample Error before we apply the model to the 
+`test` set, let's check it with the `validation` set:
+
+```{r training04, eval=TRUE, echo=TRUE}
+validation_x <- validation[,-53]
+validation_trueOutcome <- validation[,53]
+validation_pred <- predict(trainingFit, validation_x)
+confusionMatrix(validation_pred, validation_trueOutcome)
+```
+
+We get a prediction accuracy of 0.9977 (~99.8%) on our validation set, with a 
+95% confidence interval of (0.9956, 0.999), so we can feel pretty confident 
+about our Random Forest model's ability to predict on new data.
+
+## <b>Conclusion:  Applying the Model to the Test Set</b>
+
+The last thing that we need to do is to apply our model fit to the provided 
+`test` set.
+
+```{r predTest01}
+test_pred <- predict(trainingFit, test)
+test_pred
+```
+
+This prediction was verified as 100% accurate, based on the Course Project 
+Prediction Quiz (on Coursera.org). Limiting our features to less than one-third 
+of the original set, combined with a Random Forest model, allows us to fit a 
+model that predicts with over 99% accuracy.
+
+## <b>Appendix</b>
+
+### *i. Citations*
+
+* Content for this analysis was made available through the <u>Practical Machine 
+Learning</u> course website, offered by Johns Hopkins University as part of the 
+Coursera *Data Science Specialization*. For more information, please visit 
+[Coursera.org](https://www.coursera.org/). Used with permission.
+* Original data set is located at 
+[http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har), 
+and is described in the paper **Qualitative Activity Recognition of Weight 
+Lifting Exercises**.
+
+
+
+> > <font size=2> Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. *Qualitative 
+> > Activity Recognition of Weight Lifting Exercises.* Proceedings of 4th 
+> > International Conference in Cooperation with SIGCHI (Augmented Human '13) . 
+> > Stuttgart, Germany: ACM SIGCHI, 2013.</font>
+
+### *ii. Installation Code for Utilized Packages*
+
+If you are missing any of the packages required for this analysis, it will not 
+perform as expected (or, possibly, at all). Please see the code below for quick 
+installation:
+
+```{r packageInstalls01, eval=FALSE, echo=TRUE}
+install.packages("pander")
+install.packages("ggplot2")
+install.packages("Cairo")
+install.packages("caret")
+install.packages("parallel")
+install.packages("doParallel")
+install.packages("randomForest")
+```
+
+Please note that there may be additional dependencies needed for these packages.
+
+### *iii. Computer Specs*
+
+This analysis was designed on a Windows 8 64-bit computer using R v3.3.0 and 
+RStudio Version 0.99.902, with all packages up-to-date. Please note that content 
+may differ if you run it in a different environment, including, but not limited 
+to:  exact Random Forest calculations, appearance of figures and plots, and 
+formatting results of RMarkdown.
